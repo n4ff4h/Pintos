@@ -38,12 +38,8 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  // Extract the program name and arguments using strtok_r
-  char *save_ptr;
-  char *prog_name = strtok_r(fn_copy, " ", &save_ptr);
-
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
 
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
@@ -65,11 +61,7 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
 
-  // Extract the program name and arguments using strtok_r
-  char *save_ptr;
-  char *prog_name = strtok_r(file_name, " ", &save_ptr);
-
-  success = load (prog_name, &if_.eip, &if_.esp);
+  success = load (file_name, &if_.eip, &if_.esp);
   
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -210,7 +202,7 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (void **esp, char **argv, int argc);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -230,6 +222,23 @@ load (const char *file_name, void (**eip) (void), void **esp)
   bool success = false;
   int i;
 
+  /*
+    Extract arguments from file
+  */
+  char *argv[32]; // Maximum number of arguments
+  int argc = 0;
+  char *save_ptr;
+  argv[0] = strtok_r(file_name, " ", &save_ptr);
+  char *token;
+
+  while ((token = strtok_r(NULL, " ", &save_ptr)) != NULL) {
+    argv[++argc] = token;
+  }
+
+  for (int i = 0; i <= argc; ++i) {
+    printf("Argument %d: %s\n", i, argv[i]);
+  }
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -237,11 +246,11 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (argv[0]);
 
   if (file == NULL) 
     {
-	printf ("load: %s: open failed\n", file_name);
+	printf ("load: %s: open failed\n", argv[0]);
       goto done; 
     }
 
@@ -254,7 +263,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
       || ehdr.e_phnum > 1024) 
     {
-      printf ("load: %s: error loading executable\n", file_name);
+      printf ("load: %s: error loading executable\n", argv[0]);
       goto done; 
     }
 
@@ -318,7 +327,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
     }
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (esp, argv, argc))
     goto done;
 
   /* Start address. */
@@ -443,7 +452,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp, char **argv, int argc) 
 {
   uint8_t *kpage;
   bool success = false;
@@ -454,11 +463,42 @@ setup_stack (void **esp)
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success) {
         *esp = PHYS_BASE - 12;
-      } else
-        palloc_free_page (kpage);
+        // Create an array to store pointers to arguments on the stack
+        uint32_t *arr[argc];
+
+        // Loop through arguments in reverse order to set up the stack
+        for (int i = argc - 1; i >= 0; --i) {
+            // Calculate the space needed for the argument string (including null terminator)
+            size_t arg_size = (strlen(argv[i]) + 1) * sizeof(char);
+            
+            // Adjust the stack pointer to make space for the argument string
+            *esp = *esp - arg_size;
+            
+            // Store the current stack pointer in the array for future reference
+            arr[i] = (uint32_t *)*esp;
+            
+            // Copy the argument string to the stack at the current stack pointer
+            memcpy(*esp, argv[i], arg_size);
+        }
+
+        // Loop through the argument pointers on the stack to set up the stack further
+        for (int i = argc - 1; i >= 0; --i) {
+            // Reserve space for a 32-bit pointer on the stack
+            *esp = *esp - sizeof(uint32_t);
+            
+            // Store the address of the argument in the array at this location
+            (*(uint32_t **)(*esp)) = arr[i];
+        }
+      }
+      else
+      {
+        palloc_free_page(kpage);
+      }
     }
+  // hex_dump(PHYS_BASE, *esp, PHYS_BASE - (*esp), true);
   return success;
 }
+
 
 /* Adds a mapping from user virtual address UPAGE to kernel
    virtual address KPAGE to the page table.
